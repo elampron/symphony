@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="$HOME/.local/bin:$PATH"
 ENV_FILE="/home/pixel/.openclaw/.env"
 WORKFLOW="$ROOT/workflows/scientiamesh-rust-cli.WORKFLOW.md"
 
