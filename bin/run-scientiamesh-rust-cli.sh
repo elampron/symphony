@@ -12,4 +12,4 @@ if [[ -z "${LINEAR_API_KEY:-}" && -f "$ENV_FILE" ]]; then
 fi
 
 cd "$ROOT/elixir"
-exec mise exec -- ./bin/symphony "$WORKFLOW" --logs-root "$ROOT/log/scientiamesh-rust-cli" --port "${SYMPHONY_PORT:-4000}"
+exec mise exec -- ./bin/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails "$WORKFLOW" --logs-root "$ROOT/log/scientiamesh-rust-cli" --port "${SYMPHONY_PORT:-4000}"
