@@ -531,14 +531,16 @@ defmodule SymphonyElixir.Codex.AppServer do
          on_message,
          metadata,
          _tool_executor,
-         _auto_approve_requests
+         auto_approve_requests
        ) do
-    send_message(port, %{"id" => id, "result" => %{"action" => "decline", "content" => nil, "_meta" => nil}})
+    {result, decision, event} = mcp_elicitation_result(payload, auto_approve_requests)
+
+    send_message(port, %{"id" => id, "result" => result})
 
     emit_message(
       on_message,
-      :mcp_elicitation_declined,
-      %{payload: payload, raw: payload_string, decision: "decline"},
+      event,
+      %{payload: payload, raw: payload_string, decision: decision},
       metadata
     )
 
@@ -939,6 +941,205 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> String.downcase()
 
     String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
+  end
+
+  defp mcp_elicitation_result(payload, true) do
+    request_params = mcp_elicitation_request_params(payload)
+
+    if bridgeable_mcp_approval_elicitation?(request_params) do
+      case mcp_elicitation_accept_result(request_params) do
+        {:ok, result} -> {result, "acceptForSession", :mcp_elicitation_auto_approved}
+        :error -> {mcp_elicitation_decline_result(), "decline", :mcp_elicitation_declined}
+      end
+    else
+      {mcp_elicitation_decline_result(), "decline", :mcp_elicitation_declined}
+    end
+  end
+
+  defp mcp_elicitation_result(_payload, false) do
+    {mcp_elicitation_decline_result(), "decline", :mcp_elicitation_declined}
+  end
+
+  defp mcp_elicitation_request_params(%{"params" => %{"requestParams" => request_params}})
+       when is_map(request_params),
+       do: request_params
+
+  defp mcp_elicitation_request_params(%{"params" => params}) when is_map(params), do: params
+  defp mcp_elicitation_request_params(_payload), do: %{}
+
+  defp bridgeable_mcp_approval_elicitation?(%{"mode" => "form", "_meta" => meta, "requestedSchema" => schema})
+       when is_map(meta) and is_map(schema) do
+    meta["codex_approval_kind"] == "mcp_tool_call" and schema["type"] == "object" and is_map(schema["properties"])
+  end
+
+  defp bridgeable_mcp_approval_elicitation?(_request_params), do: false
+
+  defp mcp_elicitation_accept_result(%{"requestedSchema" => %{"properties" => properties} = schema, "_meta" => meta})
+       when is_map(properties) and is_map(meta) do
+    case mcp_elicitation_content(schema, meta) do
+      {:ok, content} ->
+        {:ok,
+         %{
+           "action" => "accept",
+           "content" => content,
+           "_meta" => mcp_elicitation_accepted_meta(meta)
+         }}
+
+      :empty_schema ->
+        {:ok,
+         %{
+           "action" => "accept",
+           "content" => nil,
+           "_meta" => mcp_elicitation_accepted_meta(meta)
+         }}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp mcp_elicitation_accept_result(_request_params), do: :error
+
+  defp mcp_elicitation_content(%{"properties" => properties} = schema, meta) when is_map(properties) do
+    required =
+      schema
+      |> Map.get("required", [])
+      |> case do
+        values when is_list(values) -> MapSet.new(Enum.filter(values, &is_binary/1))
+        _ -> MapSet.new()
+      end
+
+    if map_size(properties) == 0 do
+      :empty_schema
+    else
+      Enum.reduce_while(properties, {:ok, %{}, false}, fn {name, property_schema}, {:ok, content, saw_approval_field} ->
+        if is_map(property_schema) do
+          approval_field? = mcp_elicitation_approval_field?(name, property_schema)
+
+          case mcp_elicitation_property_value(name, property_schema, approval_field?, meta) do
+            {:ok, value} ->
+              {:cont, {:ok, Map.put(content, name, value), saw_approval_field or approval_field?}}
+
+            :skip ->
+              if MapSet.member?(required, name) do
+                {:halt, :error}
+              else
+                {:cont, {:ok, content, saw_approval_field or approval_field?}}
+              end
+          end
+        else
+          {:cont, {:ok, content, saw_approval_field}}
+        end
+      end)
+      |> case do
+        {:ok, content, true} -> {:ok, content}
+        {:ok, _content, false} -> :error
+        :error -> :error
+      end
+    end
+  end
+
+  defp mcp_elicitation_property_value(_name, %{"type" => "boolean"}, true, _meta), do: {:ok, true}
+
+  defp mcp_elicitation_property_value(_name, schema, true, _meta) do
+    schema
+    |> mcp_elicitation_enum_options()
+    |> Enum.find(&mcp_elicitation_session_approval_option?/1)
+    |> case do
+      nil -> Enum.find(mcp_elicitation_enum_options(schema), &mcp_elicitation_positive_approval_option?/1)
+      option -> option
+    end
+    |> case do
+      nil -> :skip
+      {value, _label} -> {:ok, value}
+    end
+  end
+
+  defp mcp_elicitation_property_value(name, schema, false, meta) do
+    if mcp_elicitation_persist_field?(name, schema) do
+      options = mcp_elicitation_enum_options(schema)
+      persist = mcp_elicitation_persist_hint(meta)
+
+      Enum.find(options, fn {value, label} -> value == persist or label == persist end)
+      |> case do
+        nil -> :skip
+        {value, _label} -> {:ok, value}
+      end
+    else
+      :skip
+    end
+  end
+
+  defp mcp_elicitation_approval_field?(name, schema) do
+    mcp_elicitation_property_text(name, schema) =~ ~r/\b(approve|approval|allow|accept|decision)\b/i
+  end
+
+  defp mcp_elicitation_persist_field?(name, schema) do
+    mcp_elicitation_property_text(name, schema) =~ ~r/\b(persist|session|always|scope)\b/i
+  end
+
+  defp mcp_elicitation_property_text(name, schema) do
+    [name, schema["title"], schema["description"]]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+  end
+
+  defp mcp_elicitation_enum_options(%{"enum" => values} = schema) when is_list(values) do
+    labels = if is_list(schema["enumNames"]), do: schema["enumNames"], else: []
+
+    values
+    |> Enum.with_index()
+    |> Enum.filter(fn {value, _index} -> is_binary(value) end)
+    |> Enum.map(fn {value, index} -> {value, Enum.at(labels, index, value)} end)
+  end
+
+  defp mcp_elicitation_enum_options(%{"oneOf" => values}) when is_list(values) do
+    values
+    |> Enum.filter(&is_map/1)
+    |> Enum.flat_map(fn option ->
+      case option["const"] do
+        value when is_binary(value) -> [{value, option["title"] || value}]
+        _ -> []
+      end
+    end)
+  end
+
+  defp mcp_elicitation_enum_options(_schema), do: []
+
+  defp mcp_elicitation_session_approval_option?({value, label}) do
+    haystack = String.downcase("#{value} #{label}")
+    String.match?(haystack, ~r/\b(session|always|persistent)\b/) and mcp_elicitation_positive_text?(haystack)
+  end
+
+  defp mcp_elicitation_positive_approval_option?({value, label}) do
+    mcp_elicitation_positive_text?(String.downcase("#{value} #{label}"))
+  end
+
+  defp mcp_elicitation_positive_text?(text) do
+    String.match?(text, ~r/\b(allow|approve|accept|yes|continue|proceed|true)\b/)
+  end
+
+  defp mcp_elicitation_accepted_meta(meta) do
+    case mcp_elicitation_persist_hint(meta) do
+      nil -> nil
+      persist -> %{"persist" => persist}
+    end
+  end
+
+  defp mcp_elicitation_persist_hint(%{"persist" => persist}) when is_binary(persist), do: persist
+
+  defp mcp_elicitation_persist_hint(%{"persist" => persist}) when is_list(persist) do
+    cond do
+      "always" in persist -> "always"
+      "session" in persist -> "session"
+      true -> nil
+    end
+  end
+
+  defp mcp_elicitation_persist_hint(_meta), do: "always"
+
+  defp mcp_elicitation_decline_result do
+    %{"action" => "decline", "content" => nil, "_meta" => nil}
   end
 
   defp await_response(port, request_id) do
