@@ -66,6 +66,46 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert MapSet.member?(updated_state.completed, "issue-no-pr")
   end
 
+  test "dispatch claim moves Todo issues to In Progress before launching an agent" do
+    parent = self()
+
+    issue = %Issue{
+      id: "issue-dispatch",
+      identifier: "SCI-82",
+      title: "Plan packaging",
+      state: "Todo"
+    }
+
+    updated_issue =
+      Orchestrator.claim_issue_for_dispatch_for_test(issue, fn issue_id, state_name ->
+        send(parent, {:state_updated, issue_id, state_name})
+        :ok
+      end)
+
+    assert_receive {:state_updated, "issue-dispatch", "In Progress"}
+    assert updated_issue.state == "In Progress"
+  end
+
+  test "dispatch claim leaves non-Todo issues alone" do
+    parent = self()
+
+    issue = %Issue{
+      id: "issue-review",
+      identifier: "SCI-76",
+      title: "Bootstrap workspace",
+      state: "In Review"
+    }
+
+    updated_issue =
+      Orchestrator.claim_issue_for_dispatch_for_test(issue, fn issue_id, state_name ->
+        send(parent, {:unexpected_state_update, issue_id, state_name})
+        :ok
+      end)
+
+    refute_receive {:unexpected_state_update, _, _}
+    assert updated_issue.state == "In Review"
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
