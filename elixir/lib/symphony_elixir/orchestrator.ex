@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @host_progress_state "In Progress"
   @host_review_state "In Review"
   @pr_check_timeout_ms 15_000
   # Slightly above the dashboard render interval so "checking now…" can render.
@@ -327,6 +328,11 @@ defmodule SymphonyElixir.Orchestrator do
   def complete_issue_after_agent_for_test(%State{} = state, issue_id, running_entry, pr_detector, state_updater)
       when is_binary(issue_id) and is_map(running_entry) and is_function(pr_detector, 1) and is_function(state_updater, 2) do
     complete_issue_after_agent(state, issue_id, running_entry, pr_detector, state_updater)
+  end
+
+  @doc false
+  def claim_issue_for_dispatch_for_test(%Issue{} = issue, state_updater) when is_function(state_updater, 2) do
+    claim_issue_for_dispatch(issue, state_updater)
   end
 
   @doc false
@@ -699,6 +705,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    issue = claim_issue_for_dispatch(issue)
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -748,6 +756,30 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: worker_host
         })
     end
+  end
+
+  defp claim_issue_for_dispatch(%Issue{} = issue) do
+    claim_issue_for_dispatch(issue, &Tracker.update_issue_state/2)
+  end
+
+  defp claim_issue_for_dispatch(%Issue{state: state_name} = issue, state_updater) do
+    if normalize_issue_state(state_name) == "todo" do
+      case state_updater.(issue.id, @host_progress_state) do
+        :ok ->
+          Logger.info("Moved issue to #{@host_progress_state} before agent dispatch: #{issue_context(issue)}")
+          %{issue | state: @host_progress_state}
+
+        {:error, reason} ->
+          Logger.warning("Failed to move issue to #{@host_progress_state} before agent dispatch: #{issue_context(issue)} reason=#{inspect(reason)}")
+          issue
+      end
+    else
+      issue
+    end
+  rescue
+    error ->
+      Logger.warning("Skipping host-side dispatch claim for #{issue_context(issue)}: #{Exception.message(error)}")
+      issue
   end
 
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
