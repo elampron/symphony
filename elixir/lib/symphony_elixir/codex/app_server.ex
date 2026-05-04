@@ -946,13 +946,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp mcp_elicitation_result(payload, true) do
     request_params = mcp_elicitation_request_params(payload)
 
-    if bridgeable_mcp_approval_elicitation?(request_params) do
-      case mcp_elicitation_accept_result(request_params) do
-        {:ok, result} -> {result, "acceptForSession", :mcp_elicitation_auto_approved}
-        :error -> {mcp_elicitation_decline_result(), "decline", :mcp_elicitation_declined}
-      end
-    else
-      {mcp_elicitation_decline_result(), "decline", :mcp_elicitation_declined}
+    case mcp_elicitation_accept_result(request_params) do
+      {:ok, result} -> {result, "acceptForSession", :mcp_elicitation_auto_approved}
+      :error -> {mcp_elicitation_decline_result(), "decline", :mcp_elicitation_declined}
     end
   end
 
@@ -967,15 +963,10 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp mcp_elicitation_request_params(%{"params" => params}) when is_map(params), do: params
   defp mcp_elicitation_request_params(_payload), do: %{}
 
-  defp bridgeable_mcp_approval_elicitation?(%{"mode" => "form", "_meta" => meta, "requestedSchema" => schema})
-       when is_map(meta) and is_map(schema) do
-    meta["codex_approval_kind"] == "mcp_tool_call" and schema["type"] == "object" and is_map(schema["properties"])
-  end
+  defp mcp_elicitation_accept_result(%{"requestedSchema" => %{"type" => "object", "properties" => properties} = schema} = request_params)
+       when is_map(properties) do
+    meta = Map.get(request_params, "_meta", %{})
 
-  defp bridgeable_mcp_approval_elicitation?(_request_params), do: false
-
-  defp mcp_elicitation_accept_result(%{"requestedSchema" => %{"properties" => properties} = schema, "_meta" => meta})
-       when is_map(properties) and is_map(meta) do
     case mcp_elicitation_content(schema, meta) do
       {:ok, content} ->
         {:ok,
@@ -998,7 +989,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp mcp_elicitation_accept_result(_request_params), do: :error
+  defp mcp_elicitation_accept_result(_request_params) do
+    {:ok, %{"action" => "accept", "content" => nil, "_meta" => %{"persist" => "always"}}}
+  end
 
   defp mcp_elicitation_content(%{"properties" => properties} = schema, meta) when is_map(properties) do
     required =
@@ -1012,34 +1005,33 @@ defmodule SymphonyElixir.Codex.AppServer do
     if map_size(properties) == 0 do
       :empty_schema
     else
-      Enum.reduce_while(properties, {:ok, %{}, false}, fn {name, property_schema}, {:ok, content, saw_approval_field} ->
+      Enum.reduce_while(properties, {:ok, %{}}, fn {name, property_schema}, {:ok, content} ->
         if is_map(property_schema) do
           approval_field? = mcp_elicitation_approval_field?(name, property_schema)
 
           case mcp_elicitation_property_value(name, property_schema, approval_field?, meta) do
             {:ok, value} ->
-              {:cont, {:ok, Map.put(content, name, value), saw_approval_field or approval_field?}}
+              {:cont, {:ok, Map.put(content, name, value)}}
 
             :skip ->
               if MapSet.member?(required, name) do
                 {:halt, :error}
               else
-                {:cont, {:ok, content, saw_approval_field or approval_field?}}
+                {:cont, {:ok, content}}
               end
           end
         else
-          {:cont, {:ok, content, saw_approval_field}}
+          {:cont, {:ok, content}}
         end
       end)
       |> case do
-        {:ok, content, true} -> {:ok, content}
-        {:ok, _content, false} -> :error
+        {:ok, content} -> {:ok, content}
         :error -> :error
       end
     end
   end
 
-  defp mcp_elicitation_property_value(_name, %{"type" => "boolean"}, true, _meta), do: {:ok, true}
+  defp mcp_elicitation_property_value(_name, %{"type" => "boolean"}, _approval_field?, _meta), do: {:ok, true}
 
   defp mcp_elicitation_property_value(_name, schema, true, _meta) do
     schema
@@ -1056,19 +1048,53 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp mcp_elicitation_property_value(name, schema, false, meta) do
-    if mcp_elicitation_persist_field?(name, schema) do
-      options = mcp_elicitation_enum_options(schema)
-      persist = mcp_elicitation_persist_hint(meta)
+    cond do
+      mcp_elicitation_persist_field?(name, schema) ->
+        options = mcp_elicitation_enum_options(schema)
+        persist = mcp_elicitation_persist_hint(meta)
 
-      Enum.find(options, fn {value, label} -> value == persist or label == persist end)
-      |> case do
-        nil -> :skip
-        {value, _label} -> {:ok, value}
-      end
-    else
-      :skip
+        Enum.find(options, fn {value, label} -> value == persist or label == persist end)
+        |> case do
+          nil -> mcp_elicitation_default_property_value(schema)
+          {value, _label} -> {:ok, value}
+        end
+
+      true ->
+        mcp_elicitation_default_property_value(schema)
     end
   end
+
+  defp mcp_elicitation_default_property_value(%{"default" => value}), do: {:ok, value}
+
+  defp mcp_elicitation_default_property_value(%{"type" => type} = schema) when type in ["string", "number", "integer", "boolean"] do
+    case mcp_elicitation_enum_options(schema) do
+      [{value, _label} | _] -> {:ok, value}
+      [] -> mcp_elicitation_primitive_default(type)
+    end
+  end
+
+  defp mcp_elicitation_default_property_value(%{"type" => "array"}), do: {:ok, []}
+  defp mcp_elicitation_default_property_value(%{"type" => "object"}), do: {:ok, %{}}
+  defp mcp_elicitation_default_property_value(%{"type" => types}) when is_list(types), do: mcp_elicitation_default_from_types(types)
+  defp mcp_elicitation_default_property_value(_schema), do: :skip
+
+  defp mcp_elicitation_default_from_types(types) do
+    cond do
+      "string" in types -> {:ok, ""}
+      "number" in types -> {:ok, 0}
+      "integer" in types -> {:ok, 0}
+      "boolean" in types -> {:ok, true}
+      "array" in types -> {:ok, []}
+      "object" in types -> {:ok, %{}}
+      "null" in types -> {:ok, nil}
+      true -> :skip
+    end
+  end
+
+  defp mcp_elicitation_primitive_default("string"), do: {:ok, ""}
+  defp mcp_elicitation_primitive_default("number"), do: {:ok, 0}
+  defp mcp_elicitation_primitive_default("integer"), do: {:ok, 0}
+  defp mcp_elicitation_primitive_default("boolean"), do: {:ok, true}
 
   defp mcp_elicitation_approval_field?(name, schema) do
     mcp_elicitation_property_text(name, schema) =~ ~r/\b(approve|approval|allow|accept|decision)\b/i
