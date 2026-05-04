@@ -68,6 +68,10 @@ Workflow:
 8. Open a GitHub PR against `ScientiaMesh/scientiamesh` with Summary, Files changed, Tests run, Risks, and Follow-ups.
 9. Move the Linear issue to `In Review` and attach/link the PR.
 
+Linear access:
+- Use Symphony's `linear_graphql` dynamic tool for Linear reads/writes, including state updates, comments, and PR attachments.
+- Do not use raw Linear token shell commands; Symphony owns Linear auth and exposes it through `linear_graphql` inside the Codex app-server session.
+
 Safety:
 - Do not merge PRs.
 - Do not deploy.
