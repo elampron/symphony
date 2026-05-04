@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @host_review_state "In Review"
+  @pr_check_timeout_ms 15_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -135,7 +137,7 @@ defmodule SymphonyElixir.Orchestrator do
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
-              |> complete_issue(issue_id)
+              |> complete_issue_after_agent(issue_id, running_entry)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
                 delay_type: :continuation,
@@ -319,6 +321,12 @@ defmodule SymphonyElixir.Orchestrator do
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+  end
+
+  @doc false
+  def complete_issue_after_agent_for_test(%State{} = state, issue_id, running_entry, pr_detector, state_updater)
+      when is_binary(issue_id) and is_map(running_entry) and is_function(pr_detector, 1) and is_function(state_updater, 2) do
+    complete_issue_after_agent(state, issue_id, running_entry, pr_detector, state_updater)
   end
 
   @doc false
@@ -768,6 +776,65 @@ defmodule SymphonyElixir.Orchestrator do
       | completed: MapSet.put(state.completed, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+  end
+
+  defp complete_issue_after_agent(%State{} = state, issue_id, running_entry) do
+    complete_issue_after_agent(state, issue_id, running_entry, &workspace_has_open_pr?/1, &Tracker.update_issue_state/2)
+  end
+
+  defp complete_issue_after_agent(%State{} = state, issue_id, running_entry, pr_detector, state_updater) do
+    maybe_move_issue_to_review(issue_id, running_entry, pr_detector, state_updater)
+    complete_issue(state, issue_id)
+  end
+
+  defp maybe_move_issue_to_review(issue_id, running_entry, pr_detector, state_updater)
+       when is_binary(issue_id) and is_map(running_entry) do
+    workspace_path = Map.get(running_entry, :workspace_path)
+    worker_host = Map.get(running_entry, :worker_host)
+
+    if is_nil(worker_host) and is_binary(workspace_path) and pr_detector.(workspace_path) do
+      case state_updater.(issue_id, @host_review_state) do
+        :ok ->
+          Logger.info("Moved issue to #{@host_review_state} after detecting an open PR: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier}")
+
+        {:error, reason} ->
+          Logger.warning("Failed to move issue to #{@host_review_state} after detecting an open PR: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} reason=#{inspect(reason)}")
+      end
+    end
+  rescue
+    error ->
+      Logger.warning("Skipping host-side review transition for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier}: #{Exception.message(error)}")
+  end
+
+  defp maybe_move_issue_to_review(_issue_id, _running_entry, _pr_detector, _state_updater), do: :ok
+
+  defp workspace_has_open_pr?(workspace_path) when is_binary(workspace_path) do
+    with true <- File.dir?(workspace_path),
+         {:ok, branch} <- run_workspace_command(workspace_path, "git", ["rev-parse", "--abbrev-ref", "HEAD"]),
+         branch <- String.trim(branch),
+         true <- branch != "" and branch != "HEAD",
+         {:ok, output} <- run_workspace_command(workspace_path, "gh", ["pr", "view", branch, "--json", "state", "--jq", ".state"]) do
+      String.trim(output) == "OPEN"
+    else
+      _ -> false
+    end
+  end
+
+  defp workspace_has_open_pr?(_workspace_path), do: false
+
+  defp run_workspace_command(workspace_path, command, args) do
+    task =
+      Task.async(fn ->
+        System.cmd(command, args, cd: workspace_path, stderr_to_stdout: true)
+      end)
+
+    case Task.yield(task, @pr_check_timeout_ms) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {output, 0}} -> {:ok, output}
+      {:ok, {_output, _status}} -> :error
+      nil -> :error
+    end
+  rescue
+    _error -> :error
   end
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
