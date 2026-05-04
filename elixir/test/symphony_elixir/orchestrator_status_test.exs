@@ -1,6 +1,71 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  test "agent completion moves an issue to In Review when the workspace has an open PR" do
+    parent = self()
+
+    state = %Orchestrator.State{
+      retry_attempts: %{"issue-review" => %{attempt: 2}},
+      completed: MapSet.new()
+    }
+
+    running_entry = %{
+      identifier: "SCI-76",
+      workspace_path: "/tmp/symphony-workspace",
+      worker_host: nil
+    }
+
+    updated_state =
+      Orchestrator.complete_issue_after_agent_for_test(
+        state,
+        "issue-review",
+        running_entry,
+        fn workspace_path ->
+          send(parent, {:pr_checked, workspace_path})
+          true
+        end,
+        fn issue_id, state_name ->
+          send(parent, {:state_updated, issue_id, state_name})
+          :ok
+        end
+      )
+
+    assert_receive {:pr_checked, "/tmp/symphony-workspace"}
+    assert_receive {:state_updated, "issue-review", "In Review"}
+    assert MapSet.member?(updated_state.completed, "issue-review")
+    refute Map.has_key?(updated_state.retry_attempts, "issue-review")
+  end
+
+  test "agent completion skips host review transition when no PR is detected" do
+    parent = self()
+    state = %Orchestrator.State{completed: MapSet.new()}
+
+    running_entry = %{
+      identifier: "SCI-77",
+      workspace_path: "/tmp/symphony-workspace",
+      worker_host: nil
+    }
+
+    updated_state =
+      Orchestrator.complete_issue_after_agent_for_test(
+        state,
+        "issue-no-pr",
+        running_entry,
+        fn workspace_path ->
+          send(parent, {:pr_checked, workspace_path})
+          false
+        end,
+        fn issue_id, state_name ->
+          send(parent, {:unexpected_state_update, issue_id, state_name})
+          :ok
+        end
+      )
+
+    assert_receive {:pr_checked, "/tmp/symphony-workspace"}
+    refute_receive {:unexpected_state_update, _, _}
+    assert MapSet.member?(updated_state.completed, "issue-no-pr")
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
