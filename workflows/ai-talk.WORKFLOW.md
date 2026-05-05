@@ -28,7 +28,7 @@ agent:
   max_concurrent_agents: 1
   max_turns: 10
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh --config 'approval_policy="never"' --config apps._default.destructive_enabled=true --config apps._default.open_world_enabled=true app-server
+  command: /home/pixel/.openclaw/workspace/Projects/symphony/bin/symphony-codex-app-server.sh
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
