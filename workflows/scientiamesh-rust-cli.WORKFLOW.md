@@ -30,10 +30,11 @@ agent:
 codex:
   command: /home/pixel/.openclaw/workspace/Projects/symphony/bin/symphony-codex-app-server.sh
   approval_policy: never
-  thread_sandbox: workspace-write
+  # TESTING MODE: full-open Codex. No Codex sandbox constraints.
+  # Keep human PR review, no auto-merge/deploy, and isolated workspaces as outer controls.
+  thread_sandbox: danger-full-access
   turn_sandbox_policy:
-    type: workspaceWrite
-    networkAccess: true
+    type: dangerFullAccess
 ---
 
 You are working on a Linear ticket for the ScientiaMesh Rust CLI project.

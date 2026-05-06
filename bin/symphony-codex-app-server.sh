@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/bin/symphony-agent-env.sh"
 
 exec codex \
+  --dangerously-bypass-approvals-and-sandbox \
   --config shell_environment_policy.inherit=all \
   --config 'model="gpt-5.5"' \
   --config model_reasoning_effort=xhigh \
